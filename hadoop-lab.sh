@@ -6,13 +6,20 @@
 #  Automates:
 #    Ex.1  Hadoop installation, one-node cluster
 #    Ex.2  Word count and grep using map and reduce tasks
+#    Ex.3  Word count Java program compiled and run with MapReduce
 #
 #  Usage:
-#    bash hadoop-lab.sh           install if needed, start Hadoop, run Ex.1 + Ex.2
+#    bash hadoop-lab.sh           install if needed, start Hadoop, run Ex.1, 2, 3
+#    bash hadoop-lab.sh ex3       run only Ex.3 again (after editing its files)
 #    bash hadoop-lab.sh start     start Hadoop only
 #    bash hadoop-lab.sh stop      stop Hadoop (Ex.1 step 35)
 #    bash hadoop-lab.sh status    show running services
 #    bash hadoop-lab.sh reset     stop Hadoop and delete all HDFS data
+#
+#  Offline use: no internet is needed if these files are on the computer or
+#  pen drive (in Downloads, Home, a mounted drive, or next to this script):
+#    hadoop-2.7.0.tar.gz   and   jdk-8u60-linux-x64.gz (or another JDK 8 tarball)
+#  An already extracted hadoop-2.7.0 and jdk1.8.0_60 in Downloads also work.
 #
 #  Run it as your normal user, not with sudo. Admin rights are not required:
 #  everything is installed inside your home folder. Safe to run again at any
@@ -23,6 +30,7 @@
 #    HADOOP_URL   your own Hadoop tarball link, tried first
 #    JDK_URL      your own JDK 8 tarball link, tried first
 #    JOB_TIMEOUT  seconds a YARN job may run before local fallback (default: 300)
+#    GREP_WORD    word or regular expression for grep (default: (CSE), as in the record)
 # =============================================================================
 set -uo pipefail
 
@@ -37,8 +45,13 @@ OUT_DIR="$HOME/hadoop-lab-output"
 ENV_FILE="$HOME/.hadoop_env"
 LOG_FILE="$HOME/hadoop-lab.log"
 KEY="$HOME/.ssh/hadoop_lab_key"
+SELF="$HOME/hadoop-lab.sh"              # kept here so stop/start work without the pen drive
+SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
+ONLINE=unknown
 EXAMPLES="share/hadoop/mapreduce/hadoop-mapreduce-examples-$HADOOP_VERSION.jar"
 JOB_TIMEOUT="${JOB_TIMEOUT:-300}"
+GREP_WORD="${GREP_WORD:-(CSE)}"
 HADOOP_SSH_OPTS_VALUE="-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o IdentitiesOnly=yes -i $KEY"
 
 DAEMONS="NameNode DataNode SecondaryNameNode ResourceManager NodeManager"
@@ -107,21 +120,31 @@ fetch() {  # fetch URL DESTINATION
 }
 
 find_local_file() {  # print the first complete file that matches any pattern
-  local dir pattern file
-  shopt -s nullglob
-  for dir in "$LAB_DIR" "$HOME" "$HOME/Desktop" "$HOME/Documents" "$PWD"; do
+  local root pattern file
+  for root in "$LAB_DIR" "$SCRIPT_DIR" "$PWD" "$HOME" /media /run/media /mnt; do
+    [ -d "$root" ] || continue
     for pattern in "$@"; do
-      for file in "$dir"/$pattern; do
+      while IFS= read -r file; do
         if gzip -t "$file" 2>/dev/null; then
-          shopt -u nullglob
           printf '%s\n' "$file"
           return 0
         fi
-      done
+      done < <(find -L "$root" -maxdepth 4 -type f -name "$pattern" 2>/dev/null)
     done
   done
-  shopt -u nullglob
   return 1
+}
+
+online() {  # checked once; a proxy may hide DNS, so assume it works
+  if [ "$ONLINE" = unknown ]; then
+    ONLINE=no
+    if [ -n "${http_proxy:-}${https_proxy:-}${HTTP_PROXY:-}${HTTPS_PROXY:-}" ] \
+       || limit 8 getent hosts archive.apache.org >/dev/null 2>&1; then
+      ONLINE=yes
+    fi
+    [ "$ONLINE" = no ] && info "No internet found. Using files already on this computer."
+  fi
+  [ "$ONLINE" = yes ]
 }
 
 # ------------------------------------------------------------- pre-checks ---
@@ -131,7 +154,7 @@ preflight() {
     *" "*) die "Your home folder path contains a space ($HOME). Hadoop 2.7.0 cannot run from it." ;;
   esac
   if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
-    die "Do not use sudo. Run: bash $0"
+    die "Do not use sudo. Run the script as your normal user."
   fi
   case "$(uname -m)" in
     x86_64)  JDK_ARCH=x64 ;;
@@ -173,7 +196,7 @@ is_jdk8() {
 
 setup_java() {
   step "Java JDK 8"
-  local candidate tarball tmp source_url
+  local candidate tarball tmp source_url public_urls
   shopt -s nullglob
   for candidate in "${JAVA_HOME:-/nonexistent}" "$LAB_DIR"/jdk* /usr/lib/jvm/* /opt/jdk* \
                    /opt/java/* /usr/java/* /usr/local/jdk* /usr/local/java/* "$HOME"/jdk*; do
@@ -189,15 +212,16 @@ setup_java() {
     info "Found $(java -version 2>&1 | grep -m1 version), but Hadoop 2.7.0 needs Java 8."
   fi
 
-  tarball=$(find_local_file 'jdk-8u*-linux-x64*.gz' 'OpenJDK8U-jdk_*linux*.tar.gz' \
-                            'amazon-corretto-8*-linux-*.tar.gz')
+  tarball=$(find_local_file 'jdk-8u*-linux-x64*.gz' 'jdk8-linux-*.tar.gz' \
+                            'OpenJDK8U-jdk_*linux*.tar.gz' 'amazon-corretto-8*-linux-*.tar.gz')
   if [ -n "$tarball" ]; then
     info "Using $tarball"
   else
     tarball="$LAB_DIR/jdk8-linux-$JDK_ARCH.tar.gz"
-    for source_url in ${JDK_URL:-} \
-      "https://api.adoptium.net/v3/binary/latest/8/ga/linux/$JDK_ARCH/jdk/hotspot/normal/eclipse" \
-      "https://corretto.aws/downloads/latest/amazon-corretto-8-$JDK_ARCH-linux-jdk.tar.gz"; do
+    public_urls=""
+    online && public_urls="https://api.adoptium.net/v3/binary/latest/8/ga/linux/$JDK_ARCH/jdk/hotspot/normal/eclipse
+      https://corretto.aws/downloads/latest/amazon-corretto-8-$JDK_ARCH-linux-jdk.tar.gz"
+    for source_url in ${JDK_URL:-} $public_urls; do
       info "Downloading JDK 8 from ${source_url%%/v3*}"
       fetch "$source_url" "$tarball" && break
       warn "That download failed."
@@ -217,7 +241,7 @@ setup_java() {
     warn "The JDK archive is not a usable Java 8 JDK."
   fi
 
-  if get_sudo "installing Java 8 with apt"; then
+  if online && get_sudo "installing Java 8 with apt"; then
     $SUDO apt-get install -y -o DPkg::Lock::Timeout=120 openjdk-8-jdk-headless
     for candidate in /usr/lib/jvm/java-8-openjdk-*; do
       if is_jdk8 "$candidate"; then
@@ -227,8 +251,8 @@ setup_java() {
       fi
     done
   fi
-  die "Java 8 could not be installed. If the college network blocks the download,
-copy a JDK 8 tarball (for example jdk-8u60-linux-x64.gz) into $LAB_DIR and run this again."
+  die "Java 8 was not found. Copy a JDK 8 tarball (for example jdk-8u60-linux-x64.gz)
+into $LAB_DIR or onto a pen drive, then run this again."
 }
 
 # ------------------------------------------------------------------ Hadoop ---
@@ -243,7 +267,7 @@ setup_hadoop() {
     ok "Already installed: $HADOOP_DIR"
     return 0
   fi
-  local tarball broken source_url base="hadoop-$HADOOP_VERSION.tar.gz"
+  local tarball broken source_url public_urls candidate base="hadoop-$HADOOP_VERSION.tar.gz"
   if [ -e "$HADOOP_DIR" ]; then
     broken="$HADOOP_DIR.incomplete-$(date +%s)"
     warn "Incomplete install found. Moving it to $broken"
@@ -254,17 +278,27 @@ setup_hadoop() {
   if [ -n "$tarball" ]; then
     info "Using $tarball"
   else
+    for candidate in "$HOME/hadoop-$HADOOP_VERSION" "/opt/hadoop-$HADOOP_VERSION" \
+                     "/usr/local/hadoop-$HADOOP_VERSION" /usr/local/hadoop; do
+      if hadoop_complete "$candidate"; then
+        info "Copying the existing Hadoop from $candidate"
+        cp -a "$candidate" "$HADOOP_DIR" && hadoop_complete "$HADOOP_DIR" \
+          && { ok "Installed: $HADOOP_DIR"; return 0; }
+        rm -rf "$HADOOP_DIR"
+      fi
+    done
     tarball="$LAB_DIR/$base"
-    for source_url in ${HADOOP_URL:-} \
-      "https://archive.apache.org/dist/hadoop/common/hadoop-$HADOOP_VERSION/$base" \
-      "https://archive.apache.org/dist/hadoop/core/hadoop-$HADOOP_VERSION/$base" \
-      "https://repo.huaweicloud.com/apache/hadoop/common/hadoop-$HADOOP_VERSION/$base"; do
+    public_urls=""
+    online && public_urls="https://archive.apache.org/dist/hadoop/common/hadoop-$HADOOP_VERSION/$base
+      https://archive.apache.org/dist/hadoop/core/hadoop-$HADOOP_VERSION/$base
+      https://repo.huaweicloud.com/apache/hadoop/common/hadoop-$HADOOP_VERSION/$base"
+    for source_url in ${HADOOP_URL:-} $public_urls; do
       info "Downloading Hadoop (about 210 MB) from $(printf '%s' "$source_url" | cut -d/ -f3)"
       fetch "$source_url" "$tarball" && break
       warn "That download failed."
     done
-    [ -f "$tarball" ] || die "Hadoop could not be downloaded. If the college network blocks it,
-copy $base into $LAB_DIR (pen drive) and run this again."
+    [ -f "$tarball" ] || die "$base was not found. Copy it into $LAB_DIR
+or onto a pen drive, then run this again."
   fi
 
   info "Extracting Hadoop"
@@ -338,12 +372,17 @@ setup_ssh() {
   prepare_ssh_key
   if ! ssh_works; then
     info "SSH login to localhost is not available yet."
-    if get_sudo "installing the OpenSSH server"; then
-      $SUDO apt-get install -y -o DPkg::Lock::Timeout=120 openssh-client openssh-server \
-        || warn "apt could not install OpenSSH."
-      $SUDO systemctl enable --now ssh 2>/dev/null || $SUDO service ssh start 2>/dev/null
-      prepare_ssh_key
-      sleep 2
+    # A server that is installed but stopped can be started without internet.
+    if command -v sshd >/dev/null 2>&1 || [ -x /usr/sbin/sshd ] || online; then
+      if get_sudo "setting up the OpenSSH server"; then
+        if [ ! -x /usr/sbin/sshd ]; then
+          $SUDO apt-get install -y -o DPkg::Lock::Timeout=120 openssh-client openssh-server \
+            || warn "apt could not install OpenSSH."
+        fi
+        $SUDO systemctl enable --now ssh 2>/dev/null || $SUDO service ssh start 2>/dev/null
+        prepare_ssh_key
+        sleep 2
+      fi
     fi
   fi
 
@@ -537,7 +576,7 @@ Stop that program, or log that user out, then run this again."
   start-dfs.sh >>"$LOG_FILE" 2>&1
   if ! wait_for 60 port_open 9000; then
     show_log NameNode
-    die "NameNode did not start. To start again with empty HDFS: bash $0 reset"
+    die "NameNode did not start. To start again with empty HDFS: bash $SELF reset"
   fi
   # Writes fail while the NameNode is in safe mode.
   limit 60 hdfs dfsadmin -safemode wait >/dev/null 2>&1 \
@@ -582,7 +621,9 @@ prepare_sample_data() {
   fi
   archive=$(find_local_file 'mrsampledata.tar.gz')
   if [ -n "$archive" ]; then
-    tar -xzf "$archive" -C "$LAB_DIR" && [ -s "$SAMPLE" ] && return 0
+    tar -xzf "$archive" -C "$LAB_DIR"
+    [ -s "$SAMPLE" ] || cp "$(find "$LAB_DIR" -maxdepth 3 -type f -name file1.txt | head -1)" "$SAMPLE" 2>/dev/null
+    [ -s "$SAMPLE" ] && return 0
   fi
   # mrsampledata.tar.gz was not found. Rebuild file1.txt from the counts printed
   # in the record: one word per line, which also gives the record's 864 KB size.
@@ -603,23 +644,30 @@ kill_stuck_apps() {
   done
 }
 
-run_job() {  # run_job OUTPUT PROGRAM ARGS...
-  local output=$1 program=$2; shift 2
-  local jar="$HADOOP_DIR/$EXAMPLES"
+local_conf() {  # a copy of the configuration that runs jobs without YARN
+  local dir="$RUN_DIR/local-conf"
+  rm -rf "$dir"
+  cp -r "$CONF_DIR" "$dir"
+  sed -i 's#<value>yarn</value>#<value>local</value>#' "$dir/mapred-site.xml"
+  printf '%s\n' "$dir"
+}
+
+run_job() {  # run_job OUTPUT LABEL JAR ARGS...
+  local output=$1 label=$2 jar=$3; shift 3
   limit 60 hdfs dfs -rm -r -f -skipTrash "$output" >/dev/null 2>&1
-  if limit "$JOB_TIMEOUT" hadoop jar "$jar" "$program" "$@" >>"$LOG_FILE" 2>&1; then
-    ok "$program finished on YARN"
+  if limit "$JOB_TIMEOUT" hadoop jar "$jar" "$@" >>"$LOG_FILE" 2>&1; then
+    ok "$label finished on YARN"
     return 0
   fi
-  warn "$program did not finish on YARN. Running it in local MapReduce mode instead."
+  warn "$label did not finish on YARN. Running it in local MapReduce mode instead."
   FELL_BACK=yes
   kill_stuck_apps
   limit 60 hdfs dfs -rm -r -f -skipTrash "$output" >/dev/null 2>&1
-  if limit 600 hadoop jar "$jar" "$program" -D mapreduce.framework.name=local "$@" >>"$LOG_FILE" 2>&1; then
-    ok "$program finished in local mode"
+  if limit 600 hadoop --config "$(local_conf)" jar "$jar" "$@" >>"$LOG_FILE" 2>&1; then
+    ok "$label finished in local mode"
     return 0
   fi
-  die "$program failed. See $LOG_FILE."
+  die "$label failed. See $LOG_FILE."
 }
 
 experiment_1() {
@@ -640,14 +688,16 @@ experiment_1() {
 experiment_2() {
   step "Experiment 2: Grep and WordCount using MapReduce"
   info "Running grep (about a minute)"
-  run_job /output grep '/user1/*' /output '(CSE)'
+  run_job /output grep "$HADOOP_DIR/$EXAMPLES" grep '/user1/*' /output "$GREP_WORD"
   info "Running wordcount (about a minute)"
-  run_job /output1 wordcount /user1/file1.txt /output1
+  run_job /output1 wordcount "$HADOOP_DIR/$EXAMPLES" wordcount /user1/file1.txt /output1
 
   local grep_output word_output
   grep_output=$(hdfs dfs -cat '/output/*' 2>/dev/null)
   word_output=$(hdfs dfs -cat '/output1/*' 2>/dev/null)
-  [ -n "$grep_output" ] || die "Grep produced no output."
+  # Zero matches is a valid result: the job worked and the word is not in the data.
+  limit 60 hdfs dfs -test -e /output/_SUCCESS || die "Grep did not produce a result."
+  [ -n "$grep_output" ] || grep_output="(no match: the input files do not contain $GREP_WORD)"
   [ -n "$word_output" ] || die "WordCount produced no output."
   {
     echo "Ex.No.2 WORD COUNT PROGRAM - USING MAP AND REDUCE TASK"
@@ -659,11 +709,134 @@ experiment_2() {
   ok "Saved to $OUT_DIR/experiment2.txt"
 }
 
+write_wordcount_java() {
+  cat >"$HADOOP_DIR/WordCount.java" <<'JAVA'
+import java.io.IOException;
+import java.util.StringTokenizer;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.IntWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+
+public class WordCount {
+
+  public static class TokenizerMapper extends Mapper<Object, Text, Text, IntWritable> {
+    private final static IntWritable one = new IntWritable(1);
+    private Text word = new Text();
+
+    public void map(Object key, Text value, Context context)
+        throws IOException, InterruptedException {
+      StringTokenizer itr = new StringTokenizer(value.toString());
+      while (itr.hasMoreTokens()) {
+        word.set(itr.nextToken());
+        context.write(word, one);
+      }
+    }
+  }
+
+  public static class IntSumReducer extends Reducer<Text, IntWritable, Text, IntWritable> {
+    private IntWritable result = new IntWritable();
+
+    public void reduce(Text key, Iterable<IntWritable> values, Context context)
+        throws IOException, InterruptedException {
+      int sum = 0;
+      for (IntWritable val : values) {
+        sum += val.get();
+      }
+      result.set(sum);
+      context.write(key, result);
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    Job job = Job.getInstance(conf, "wordcount");
+    job.setJarByClass(WordCount.class);
+    job.setMapperClass(TokenizerMapper.class);
+    job.setCombinerClass(IntSumReducer.class);
+    job.setReducerClass(IntSumReducer.class);
+    job.setOutputKeyClass(Text.class);
+    job.setOutputValueClass(IntWritable.class);
+    FileInputFormat.addInputPath(job, new Path(args[0]));
+    FileOutputFormat.setOutputPath(job, new Path(args[1]));
+    System.exit(job.waitForCompletion(true) ? 0 : 1);
+  }
+}
+JAVA
+}
+
+write_ex3_inputs() {  # the record's algorithm text, split into its three input files
+  cat >"$HADOOP_DIR/input.txt" <<'TEXT'
+STEPS:
+1. Open an editor and type WordCount program and save as WordCount.java
+2. Set the path as export HADOOP_CLASSPATH=${JAVA_HOME}/lib/tools.jar
+3. To compile the program, bin/hadoop com.sun.tools.javac.Main WordCount.java
+TEXT
+  cat >"$HADOOP_DIR/input1.txt" <<'TEXT'
+4. Create a jar file, jar cf wc.jar WordCount*.class
+5. Create input files input.txt,input1.txt and input2.txt and create a directory in hdfs, /mit/wordcount/input
+TEXT
+  cat >"$HADOOP_DIR/input2.txt" <<'TEXT'
+6. Move these i/p files to the hdfs system, bin/hadoop fs -put /opt/hadoop-2.7.0/input.txt /mit/wordcount/input/input.txt repeat this step for other two i/p files.
+7. To execute, bin/hadoop jar wc.jar WordCount /mit/wordcount/input /mit/wordcount/output.
+8. The mapreduce result will be available in the output directory.
+TEXT
+}
+
+experiment_3() {
+  step "Experiment 3: WordCount Java program using MapReduce"
+  local name input_list="input.txt input1.txt input2.txt" result
+  # Files you have edited are kept. Delete one to get the original back.
+  [ -s "$HADOOP_DIR/WordCount.java" ] || write_wordcount_java
+  [ -s "$HADOOP_DIR/input.txt" ] && [ -s "$HADOOP_DIR/input1.txt" ] \
+    && [ -s "$HADOOP_DIR/input2.txt" ] || write_ex3_inputs
+
+  info "Compiling WordCount.java"
+  if ! ( cd "$HADOOP_DIR" \
+         && rm -f WordCount*.class wc.jar \
+         && HADOOP_CLASSPATH="$JAVA_HOME/lib/tools.jar" hadoop com.sun.tools.javac.Main WordCount.java \
+         && "$JAVA_HOME/bin/jar" cf wc.jar WordCount*.class ) >>"$LOG_FILE" 2>&1; then
+    grep -E 'error:' "$LOG_FILE" | tail -5 | sed 's/^/    /'
+    die "WordCount.java did not compile. To restore the original file:
+rm $HADOOP_DIR/WordCount.java
+then run: bash $SELF ex3"
+  fi
+  ok "Created wc.jar"
+
+  limit 60 hdfs dfs -rm -r -f -skipTrash /mit/wordcount/input >/dev/null 2>&1
+  hdfs dfs -mkdir -p /mit/wordcount/input || die "Could not create /mit/wordcount/input."
+  for name in $input_list; do
+    hdfs dfs -put -f "$HADOOP_DIR/$name" "/mit/wordcount/input/$name" \
+      || die "Could not upload $name to HDFS."
+  done
+  ok "Uploaded input.txt, input1.txt and input2.txt to /mit/wordcount/input"
+
+  info "Running WordCount (about a minute)"
+  run_job /mit/wordcount/output "WordCount program" "$HADOOP_DIR/wc.jar" \
+    WordCount /mit/wordcount/input /mit/wordcount/output
+
+  result=$(hdfs dfs -cat '/mit/wordcount/output/*' 2>/dev/null)
+  [ -n "$result" ] || die "The WordCount program produced no output."
+  {
+    echo "Ex.No.3 IMPLEMENT WORD COUNT / FREQUENCY PROGRAMS USING MAPREDUCE"
+    echo
+    echo "\$ hdfs dfs -cat /mit/wordcount/output/*"; echo "$result"
+  } | tee "$OUT_DIR/experiment3.txt" | sed 's/^/    /'
+  cp "$HADOOP_DIR/WordCount.java" "$OUT_DIR/WordCount.java"
+  ok "Saved to $OUT_DIR/experiment3.txt"
+  ok "Program saved to $OUT_DIR/WordCount.java"
+}
+
 summary() {
   cat <<EOF
 
 ==============================================================================
-  DONE: Experiments 1 and 2 finished.
+  DONE: Experiments 1, 2 and 3 finished.
 
   HDFS web page   http://localhost:50070
   YARN web page   http://localhost:8088
@@ -671,8 +844,8 @@ summary() {
   Hadoop folder   $HADOOP_DIR
 
   Hadoop is still running, so you can check the web pages.
-  To stop it:     bash $0 stop
-  After a reboot: bash $0
+  To stop it:     bash $SELF stop
+  After a reboot: bash $SELF
 ==============================================================================
 EOF
   [ "$SSH_MODE" = direct ] && \
@@ -686,17 +859,20 @@ EOF
 
 # -------------------------------------------------------------- entry point ---
 load_installed() {
-  [ -f "$ENV_FILE" ] || die "Hadoop is not installed yet. Run: bash $0"
+  [ -f "$ENV_FILE" ] || die "Hadoop is not installed yet. Run: bash $SELF"
   . "$ENV_FILE"
   JAVA_HOME="${JAVA_HOME:-}"
   is_jdk8 "$JAVA_HOME" && hadoop_complete "$HADOOP_DIR" \
-    || die "The installation is incomplete. Run: bash $0"
+    || die "The installation is incomplete. Run: bash $SELF"
   use_environment
 }
 
 main() {
   local action="${1:-all}"
   touch "$LOG_FILE" || { echo "Cannot write to $LOG_FILE"; exit 1; }
+  if [ -f "$SCRIPT_PATH" ] && [ "$SCRIPT_PATH" != "$SELF" ]; then
+    cp -f "$SCRIPT_PATH" "$SELF" && chmod u+rw "$SELF"
+  fi
   exec > >(tee -a "$LOG_FILE") 2>&1
   trap 'sleep 0.3' EXIT   # let the last lines reach the screen
   printf '\n----- hadoop-lab %s: %s -----\n' "$action" "$(date)" >>"$LOG_FILE"
@@ -713,9 +889,11 @@ main() {
       check_services
       experiment_1
       experiment_2
+      experiment_3
       summary
       ;;
     start)  load_installed; start_services; check_services ;;
+    ex3)    load_installed; start_services; check_services; experiment_3 ;;
     stop)   load_installed; step "Stopping Hadoop"; stop_services; ok "Hadoop stopped" ;;
     status) load_installed; jps | sort -k2 ;;
     reset)
@@ -724,9 +902,9 @@ main() {
       stop_services
       rm -rf "$DATA_DIR"
       mkdir -p "$DATA_DIR"
-      ok "Hadoop stopped and HDFS data deleted. Run: bash $0"
+      ok "Hadoop stopped and HDFS data deleted. Run: bash $SELF"
       ;;
-    *) echo "Usage: bash $0 [start|stop|status|reset]"; exit 2 ;;
+    *) echo "Usage: bash $0 [ex3|start|stop|status|reset]"; exit 2 ;;
   esac
 }
 
