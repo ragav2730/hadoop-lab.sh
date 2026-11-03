@@ -11,6 +11,7 @@
 #  Usage:
 #    bash hadoop-lab.sh           install if needed, start Hadoop, run Ex.1, 2, 3
 #    bash hadoop-lab.sh ex3       run only Ex.3 again (after editing its files)
+#    bash hadoop-lab.sh newdata   make new random sample files and run Ex.1, 2, 3
 #    bash hadoop-lab.sh start     start Hadoop only
 #    bash hadoop-lab.sh stop      stop Hadoop (Ex.1 step 35)
 #    bash hadoop-lab.sh status    show running services
@@ -31,6 +32,8 @@
 #    JDK_URL      your own JDK 8 tarball link, tried first
 #    JOB_TIMEOUT  seconds a YARN job may run before local fallback (default: 300)
 #    GREP_WORD    word or regular expression for grep (default: (CSE), as in the record)
+#    LAB_DATA     random (default): small sample files with random word counts
+#                 record: the larger sample built from the lab record's numbers
 # =============================================================================
 set -uo pipefail
 
@@ -52,8 +55,10 @@ ONLINE=unknown
 EXAMPLES="share/hadoop/mapreduce/hadoop-mapreduce-examples-$HADOOP_VERSION.jar"
 JOB_TIMEOUT="${JOB_TIMEOUT:-300}"
 GREP_WORD="${GREP_WORD:-(CSE)}"
+LAB_DATA="${LAB_DATA:-random}"
 HADOOP_SSH_OPTS_VALUE="-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o IdentitiesOnly=yes -i $KEY"
 
+HADOOP_PROCESSES='org\.apache\.hadoop\.(hdfs\.server|hdfs\.qjournal|yarn\.server|mapreduce\.v2\.app\.MRAppMaster|mapred\.YarnChild)'
 DAEMONS="NameNode DataNode SecondaryNameNode ResourceManager NodeManager"
 PORTS="9000 50070 50010 50020 50075 50090 8030 8031 8032 8033 8040 8042 8088 13562"
 
@@ -520,13 +525,14 @@ show_log() {
 stop_services() {
   stop-yarn.sh >/dev/null 2>&1
   stop-dfs.sh  >/dev/null 2>&1
-  # Anything of ours still alive, including daemons from an older install.
+  # Anything of ours still alive: daemons from an older install, and job
+  # processes (MRAppMaster, YarnChild) left behind by an interrupted run.
   local pid
-  for pid in $(pgrep -u "$(id -u)" -f 'org\.apache\.hadoop\.(hdfs\.server|hdfs\.qjournal|yarn\.server)'); do
+  for pid in $(pgrep -u "$(id -u)" -f "$HADOOP_PROCESSES"); do
     kill "$pid" 2>/dev/null
   done
   sleep 2
-  for pid in $(pgrep -u "$(id -u)" -f 'org\.apache\.hadoop\.(hdfs\.server|hdfs\.qjournal|yarn\.server)'); do
+  for pid in $(pgrep -u "$(id -u)" -f "$HADOOP_PROCESSES"); do
     kill -9 "$pid" 2>/dev/null
   done
   rm -f "$RUN_DIR"/*.pid
@@ -625,16 +631,29 @@ prepare_sample_data() {
     [ -s "$SAMPLE" ] || cp "$(find "$LAB_DIR" -maxdepth 3 -type f -name file1.txt | head -1)" "$SAMPLE" 2>/dev/null
     [ -s "$SAMPLE" ] && return 0
   fi
-  # mrsampledata.tar.gz was not found. Rebuild file1.txt from the counts printed
-  # in the record: one word per line, which also gives the record's 864 KB size.
+  # mrsampledata.tar.gz was not found, so make a sample file.
   SAMPLE_REBUILT=yes
   touch "$marker"
-  local entry
-  for entry in B.ARCH:9864 'B.TECH(BIO):9964' 'B.TECH(IT):10000' 'BE(AME):9853' \
-               'BE(CIVIL):10043' 'BE(CSE):9894' 'BE(ECE):10048' 'BE(EEE):9937' \
-               'BE(ICE):9872' 'BE(MECH):9873'; do
-    yes "${entry%%:*}" | head -n "${entry##*:}"
-  done | shuf --random-source=<(yes) >"$SAMPLE"
+  if [ "$LAB_DATA" = record ]; then
+    # The counts printed in the record: one word per line, 864 KB in total.
+    local entry
+    for entry in B.ARCH:9864 'B.TECH(BIO):9964' 'B.TECH(IT):10000' 'BE(AME):9853' \
+                 'BE(CIVIL):10043' 'BE(CSE):9894' 'BE(ECE):10048' 'BE(EEE):9937' \
+                 'BE(ICE):9872' 'BE(MECH):9873'; do
+      yes "${entry%%:*}" | head -n "${entry##*:}"
+    done | shuf --random-source=<(yes) >"$SAMPLE"
+  else
+    random_words 5 50 B.ARCH 'B.TECH(BIO)' 'B.TECH(IT)' 'BE(AME)' 'BE(CIVIL)' \
+                 'BE(CSE)' 'BE(ECE)' 'BE(EEE)' 'BE(ICE)' 'BE(MECH)' >"$SAMPLE"
+  fi
+}
+
+random_words() {  # random_words MIN MAX WORD...: each word a random number of times, shuffled
+  local low=$1 high=$2 word count; shift 2
+  for word in "$@"; do
+    count=$((low + RANDOM % (high - low + 1)))
+    while [ "$count" -gt 0 ]; do printf '%s\n' "$word"; count=$((count - 1)); done
+  done | shuf
 }
 
 kill_stuck_apps() {
@@ -652,17 +671,39 @@ local_conf() {  # a copy of the configuration that runs jobs without YARN
   printf '%s\n' "$dir"
 }
 
+yarn_report() {  # save what is needed to find out why YARN did not finish a job
+  local file
+  {
+    echo "YARN problem report, $(date)"
+    echo; echo "--- memory, disk, processors"; free -h; df -h "$HOME"; nproc
+    echo; echo "--- computer name"; hostname; getent hosts "$(hostname)"
+    echo; echo "--- running processes"; jps
+    echo; echo "--- yarn node -list -all"; limit 20 yarn node -list -all
+    echo; echo "--- yarn application -list -appStates ALL"
+    limit 20 yarn application -list -appStates ALL
+    echo; echo "--- last job logs"
+    for file in $(ls -t "$HADOOP_DIR"/logs/userlogs/*/*/stderr "$HADOOP_DIR"/logs/userlogs/*/*/syslog 2>/dev/null | head -4); do
+      echo "## $file"; tail -25 "$file"
+    done
+    echo; echo "--- NodeManager errors"
+    grep -hE 'ERROR|FATAL|unhealthy|UNHEALTHY' "$HADOOP_DIR"/logs/yarn-*-nodemanager-*.log 2>/dev/null | tail -15
+  } >"$OUT_DIR/yarn-problem.txt" 2>&1
+}
+
 run_job() {  # run_job OUTPUT LABEL JAR ARGS...
   local output=$1 label=$2 jar=$3; shift 3
   limit 60 hdfs dfs -rm -r -f -skipTrash "$output" >/dev/null 2>&1
-  if limit "$JOB_TIMEOUT" hadoop jar "$jar" "$@" >>"$LOG_FILE" 2>&1; then
-    ok "$label finished on YARN"
-    return 0
+  if [ "$FELL_BACK" = no ]; then
+    if limit "$JOB_TIMEOUT" hadoop jar "$jar" "$@" >>"$LOG_FILE" 2>&1; then
+      ok "$label finished on YARN"
+      return 0
+    fi
+    warn "$label did not finish on YARN. Using local MapReduce mode from now on."
+    FELL_BACK=yes
+    yarn_report
+    kill_stuck_apps
+    limit 60 hdfs dfs -rm -r -f -skipTrash "$output" >/dev/null 2>&1
   fi
-  warn "$label did not finish on YARN. Running it in local MapReduce mode instead."
-  FELL_BACK=yes
-  kill_stuck_apps
-  limit 60 hdfs dfs -rm -r -f -skipTrash "$output" >/dev/null 2>&1
   if limit 600 hadoop --config "$(local_conf)" jar "$jar" "$@" >>"$LOG_FILE" 2>&1; then
     ok "$label finished in local mode"
     return 0
@@ -770,7 +811,16 @@ public class WordCount {
 JAVA
 }
 
-write_ex3_inputs() {  # the record's algorithm text, split into its three input files
+write_ex3_inputs() {
+  if [ "$LAB_DATA" != record ]; then
+    # Ten words with random counts, six words a line, across the three files.
+    SAMPLE_REBUILT=yes
+    random_words 3 15 hadoop mapreduce hdfs yarn java data cluster node mapper reducer \
+      | xargs -n 6 \
+      | awk -v dir="$HADOOP_DIR" '{ n = NR % 3; print > (dir "/input" (n ? n : "") ".txt") }'
+    return 0
+  fi
+  # The record's algorithm text, split into its three input files.
   cat >"$HADOOP_DIR/input.txt" <<'TEXT'
 STEPS:
 1. Open an editor and type WordCount program and save as WordCount.java
@@ -851,9 +901,10 @@ EOF
   [ "$SSH_MODE" = direct ] && \
     echo "NOTE: SSH was unavailable, so Hadoop was started without it."
   [ "$SAMPLE_REBUILT" = yes ] && \
-    echo "NOTE: mrsampledata.tar.gz was not found. file1.txt was rebuilt from the counts in the record."
+    echo "NOTE: These results use sample files made by this script, not your staff's mrsampledata.tar.gz."
   [ "$FELL_BACK" = yes ] && \
-    echo "NOTE: A job ran in local mode, not on YARN. Details are in $LOG_FILE."
+    echo "NOTE: YARN did not finish a job, so jobs ran in local mode. The results are still correct.
+      Details: $OUT_DIR/yarn-problem.txt"
   return 0
 }
 
@@ -896,6 +947,19 @@ main() {
     ex3)    load_installed; start_services; check_services; experiment_3 ;;
     stop)   load_installed; step "Stopping Hadoop"; stop_services; ok "Hadoop stopped" ;;
     status) load_installed; jps | sort -k2 ;;
+    newdata)
+      load_installed
+      rm -f "$LAB_DIR/file1.txt" "$OUT_DIR/.file1-rebuilt" \
+            "$HADOOP_DIR/input.txt" "$HADOOP_DIR/input1.txt" "$HADOOP_DIR/input2.txt"
+      start_services
+      check_services
+      experiment_1
+      experiment_2
+      experiment_3
+      echo
+      echo "DONE: New sample files made and Experiments 1, 2 and 3 finished."
+      [ "$FELL_BACK" = yes ] && echo "NOTE: YARN did not finish a job. Details: $OUT_DIR/yarn-problem.txt"
+      ;;
     reset)
       load_installed
       step "Resetting HDFS"
@@ -904,7 +968,7 @@ main() {
       mkdir -p "$DATA_DIR"
       ok "Hadoop stopped and HDFS data deleted. Run: bash $SELF"
       ;;
-    *) echo "Usage: bash $0 [ex3|start|stop|status|reset]"; exit 2 ;;
+    *) echo "Usage: bash $0 [ex3|newdata|start|stop|status|reset]"; exit 2 ;;
   esac
 }
 
