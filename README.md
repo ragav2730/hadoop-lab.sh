@@ -4,3 +4,39 @@ to run second program there is a file in downloads/file1.txt (you can alter as p
 hdfs dfs -cat /output1/*
 
 
+———
+lines = LOAD '/user/cloudera/HDFSFILE.txt' AS (line:chararray);
+
+words = FOREACH lines GENERATE FLATTEN(TOKENIZE(line)) AS word;
+
+grouped = GROUP words BY word;
+
+wordcount = FOREACH grouped GENERATE group, COUNT(words);
+
+DUMP wordcount;
+
+
+
+# 1. Create input text file
+nano HDFSFILE.txt
+
+# 2. Create Pig program
+nano pigexp.pig
+
+# 3. Edit Pig program (if required)
+nano pigexp.pig
+
+# 4. Create directory in HDFS
+hdfs dfs -mkdir -p /user/cloudera
+
+# 5. Upload text file to HDFS
+hdfs dfs -put HDFSFILE.txt /user/cloudera
+
+# 6. Execute Pig program
+pig pigexp.pig
+
+
+
+
+
+
