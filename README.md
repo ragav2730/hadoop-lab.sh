@@ -4,7 +4,6 @@ to run second program there is a file in downloads/file1.txt (you can alter as p
 hdfs dfs -cat /output1/*
 
 
-———
 lines = LOAD '/user/cloudera/HDFSFILE.txt' AS (line:chararray);
 
 words = FOREACH lines GENERATE FLATTEN(TOKENIZE(line)) AS word;
@@ -34,6 +33,30 @@ hdfs dfs -put HDFSFILE.txt /user/cloudera
 
 # 6. Execute Pig program
 pig pigexp.pig
+
+
+
+
+CREATE DATABASE stu;
+
+USE stu;
+
+CREATE TABLE stu2 (
+    sid INT,
+    name STRING,
+    gpa FLOAT
+);
+
+INSERT INTO TABLE stu2 VALUES
+(1, 'Raja', 5.0),
+(2, 'Kumar', 8.5),
+(3, 'Ravi', 9.0);
+
+SHOW DATABASES;
+
+SELECT * FROM stu2;
+
+
 
 
 
