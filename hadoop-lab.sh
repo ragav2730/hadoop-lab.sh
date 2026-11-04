@@ -7,11 +7,13 @@
 #    Ex.1  Hadoop installation, one-node cluster
 #    Ex.2  Word count and grep using map and reduce tasks
 #    Ex.3  Word count Java program compiled and run with MapReduce
+#    Ex.4  Weather dataset: Java program and MapReduce job
 #
 #  Usage:
-#    bash hadoop-lab.sh           install if needed, start Hadoop, run Ex.1, 2, 3
+#    bash hadoop-lab.sh           install if needed, start Hadoop, run Ex.1, 2, 3, 4
 #    bash hadoop-lab.sh ex3       run only Ex.3 again (after editing its files)
-#    bash hadoop-lab.sh newdata   make new random sample files and run Ex.1, 2, 3
+#    bash hadoop-lab.sh ex4       run only Ex.4 again (after editing its files)
+#    bash hadoop-lab.sh newdata   make new random sample files and run Ex.1, 2, 3, 4
 #    bash hadoop-lab.sh start     start Hadoop only
 #    bash hadoop-lab.sh stop      stop Hadoop (Ex.1 step 35)
 #    bash hadoop-lab.sh status    show running services
@@ -882,11 +884,221 @@ then run: bash $SELF ex3"
   ok "Program saved to $OUT_DIR/WordCount.java"
 }
 
+write_weather_analyzer() {  # the record's program
+  cat >"$HADOOP_DIR/WeatherAnalyzer.java" <<'JAVA'
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+
+public class WeatherAnalyzer {
+  public static void main(String[] args) {
+    if (args.length != 1) {
+      System.err.println("Usage: WeatherAnalyzer <inputfile>");
+      System.exit(1);
+    }
+    String inputFile = args[0];
+    try (BufferedReader reader = new BufferedReader(new FileReader(inputFile))) {
+      String line;
+      int maxTemperature = Integer.MIN_VALUE;
+      int minTemperature = Integer.MAX_VALUE;
+
+      while ((line = reader.readLine()) != null) {
+        String[] tokens = line.split("\t");
+        if (tokens.length >= 2) {
+          int temperature = Integer.parseInt(tokens[1]);
+          if (temperature > maxTemperature) {
+            maxTemperature = temperature;
+          }
+          if (temperature < minTemperature) {
+            minTemperature = temperature;
+          }
+        }
+      }
+      System.out.println("Maximum Temperature: " + maxTemperature);
+      System.out.println("Minimum Temperature: " + minTemperature);
+
+    } catch (IOException e) {
+      System.err.println("Error reading input file: " + e.getMessage());
+    } catch (NumberFormatException e) {
+      System.err.println("Invalid temperature value: " + e.getMessage());
+    }
+  }
+}
+JAVA
+}
+
+write_weather_mr() {  # the MapReduce job behind the record's per-city output files
+  cat >"$HADOOP_DIR/WeatherMR.java" <<'JAVA'
+import java.io.IOException;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.mapreduce.lib.output.MultipleOutputs;
+
+// Input lines, separated by tabs:  city  date  time  temperature
+// Output: one file per city, with the lowest and highest temperature of each day.
+public class WeatherMR {
+
+  public static class WeatherMapper extends Mapper<LongWritable, Text, Text, Text> {
+    private Text outKey = new Text();
+    private Text outValue = new Text();
+
+    public void map(LongWritable key, Text value, Context context)
+        throws IOException, InterruptedException {
+      String[] fields = value.toString().split("\t");
+      if (fields.length < 4) {
+        return;                         // skip incomplete lines
+      }
+      try {
+        Double.parseDouble(fields[3]);
+      } catch (NumberFormatException e) {
+        return;                         // skip lines with a bad temperature
+      }
+      outKey.set(fields[0] + "\t" + fields[1]);          // city and date
+      outValue.set(fields[2] + "\t" + fields[3]);        // time and temperature
+      context.write(outKey, outValue);
+    }
+  }
+
+  public static class WeatherReducer extends Reducer<Text, Text, Text, Text> {
+    private MultipleOutputs<Text, Text> outputs;
+
+    protected void setup(Context context) {
+      outputs = new MultipleOutputs<Text, Text>(context);
+    }
+
+    public void reduce(Text key, Iterable<Text> values, Context context)
+        throws IOException, InterruptedException {
+      double min = Double.MAX_VALUE;
+      double max = -Double.MAX_VALUE;
+      String minTime = "";
+      String maxTime = "";
+
+      for (Text value : values) {
+        String[] fields = value.toString().split("\t");
+        double temperature = Double.parseDouble(fields[1]);
+        if (temperature < min) {
+          min = temperature;
+          minTime = fields[0];
+        }
+        if (temperature > max) {
+          max = temperature;
+          maxTime = fields[0];
+        }
+      }
+
+      String[] cityAndDate = key.toString().split("\t");
+      String result = "Time:" + minTime + "\tMinTemp:" + min
+          + "\tTime:" + maxTime + "\tMaxTemp:" + max;
+      outputs.write(new Text(cityAndDate[1]), new Text(result), cityAndDate[0]);
+    }
+
+    protected void cleanup(Context context) throws IOException, InterruptedException {
+      outputs.close();
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    Job job = Job.getInstance(conf, "weather");
+    job.setJarByClass(WeatherMR.class);
+    job.setMapperClass(WeatherMapper.class);
+    job.setReducerClass(WeatherReducer.class);
+    job.setOutputKeyClass(Text.class);
+    job.setOutputValueClass(Text.class);
+    FileInputFormat.addInputPath(job, new Path(args[0]));
+    FileOutputFormat.setOutputPath(job, new Path(args[1]));
+    System.exit(job.waitForCompletion(true) ? 0 : 1);
+  }
+}
+JAVA
+}
+
+write_weather_data() {  # random readings: 6 cities, 3 days, 8 readings a day
+  awk -v seed="$RANDOM$RANDOM" 'BEGIN {
+    srand(seed)
+    n = split("Austin Baltimore Boston California Newjersey Newyork", city, " ")
+    m = split("25-Jan-2018 26-Jan-2018 27-Jan-2018", day, " ")
+    for (i = 1; i <= n; i++) for (j = 1; j <= m; j++) for (k = 1; k <= 8; k++)
+      printf "%s\t%s\t%02d:%02d:%03d\t%.1f\n", city[i], day[j],
+             int(rand() * 24), int(rand() * 60), int(rand() * 1000), -30 + rand() * 86
+  }' >"$HADOOP_DIR/weather.txt"
+  SAMPLE_REBUILT=yes
+}
+
+compile_failed() {  # compile_failed FILE
+  grep -E 'error:' "$LOG_FILE" | tail -5 | sed 's/^/    /'
+  die "$1 did not compile. To restore the original file:
+rm $HADOOP_DIR/$1
+then run: bash $SELF ex4"
+}
+
+experiment_4() {
+  step "Experiment 4: MapReduce program that processes a weather dataset"
+  local base="/user/$USER/testfs" city result summary_text
+  # Files you have edited are kept. Delete one to get the original back.
+  [ -s "$HADOOP_DIR/WeatherAnalyzer.java" ] || write_weather_analyzer
+  [ -s "$HADOOP_DIR/WeatherMR.java" ] || write_weather_mr
+  [ -s "$HADOOP_DIR/weather.txt" ] || write_weather_data
+  # The record's program reads:  date  whole-number temperature
+  awk -F '\t' 'NF >= 4 && $4 ~ /^-?[0-9.]+$/ { printf "%s\t%d\n", $2, $4 }' \
+    "$HADOOP_DIR/weather.txt" >"$HADOOP_DIR/temperature.txt"
+
+  info "Compiling WeatherAnalyzer.java and WeatherMR.java"
+  ( cd "$HADOOP_DIR" && rm -f WeatherAnalyzer*.class \
+    && "$JAVA_HOME/bin/javac" WeatherAnalyzer.java ) >>"$LOG_FILE" 2>&1 \
+    || compile_failed WeatherAnalyzer.java
+  ( cd "$HADOOP_DIR" && rm -f WeatherMR*.class weather.jar \
+    && HADOOP_CLASSPATH="$JAVA_HOME/lib/tools.jar" hadoop com.sun.tools.javac.Main WeatherMR.java \
+    && "$JAVA_HOME/bin/jar" cf weather.jar WeatherMR*.class ) >>"$LOG_FILE" 2>&1 \
+    || compile_failed WeatherMR.java
+  ok "Created WeatherAnalyzer.class and weather.jar"
+
+  summary_text=$( cd "$HADOOP_DIR" && "$JAVA_HOME/bin/java" -cp . WeatherAnalyzer temperature.txt 2>&1 )
+  printf '%s\n' "$summary_text" | grep -q 'Maximum Temperature' \
+    || die "WeatherAnalyzer failed: $summary_text"
+  ok "WeatherAnalyzer finished"
+
+  hdfs dfs -mkdir -p "$base/input" || die "Could not create $base/input in HDFS."
+  hdfs dfs -put -f "$HADOOP_DIR/weather.txt" "$base/input/weather.txt" \
+    || die "Could not upload weather.txt to HDFS."
+  ok "Uploaded weather.txt to $base/input"
+
+  info "Running the weather MapReduce job (about a minute)"
+  run_job "$base/output_mapred3" "Weather MapReduce job" "$HADOOP_DIR/weather.jar" \
+    WeatherMR "$base/input" "$base/output_mapred3"
+
+  result=$(hdfs dfs -ls "$base/output_mapred3" 2>/dev/null)
+  printf '%s\n' "$result" | grep -q -- '-r-00000' \
+    || die "The weather job did not create its output files."
+  {
+    echo "EX.NO:4 IMPLEMENT AN MR PROGRAM THAT PROCESSES A WEATHER DATASET"
+    echo
+    echo "\$ java WeatherAnalyzer temperature.txt"; echo "$summary_text"
+    echo
+    echo "\$ hdfs dfs -ls $base/output_mapred3"; echo "$result"
+    for city in $(printf '%s\n' "$result" | sed -n 's#.*/\([^/]*\)-r-00000$#\1#p' | grep -vx part); do
+      echo
+      echo "\$ hdfs dfs -cat $base/output_mapred3/$city-r-00000"
+      hdfs dfs -cat "$base/output_mapred3/$city-r-00000" 2>/dev/null
+    done
+  } | tee "$OUT_DIR/experiment4.txt" | sed 's/^/    /'
+  cp "$HADOOP_DIR/WeatherAnalyzer.java" "$HADOOP_DIR/WeatherMR.java" "$OUT_DIR/"
+  ok "Saved to $OUT_DIR/experiment4.txt"
+  ok "Programs saved to $OUT_DIR"
+}
+
 summary() {
   cat <<EOF
 
 ==============================================================================
-  DONE: Experiments 1, 2 and 3 finished.
+  DONE: Experiments 1, 2, 3 and 4 finished.
 
   HDFS web page   http://localhost:50070
   YARN web page   http://localhost:8088
@@ -941,23 +1153,27 @@ main() {
       experiment_1
       experiment_2
       experiment_3
+      experiment_4
       summary
       ;;
     start)  load_installed; start_services; check_services ;;
     ex3)    load_installed; start_services; check_services; experiment_3 ;;
+    ex4)    load_installed; start_services; check_services; experiment_4 ;;
     stop)   load_installed; step "Stopping Hadoop"; stop_services; ok "Hadoop stopped" ;;
     status) load_installed; jps | sort -k2 ;;
     newdata)
       load_installed
       rm -f "$LAB_DIR/file1.txt" "$OUT_DIR/.file1-rebuilt" \
-            "$HADOOP_DIR/input.txt" "$HADOOP_DIR/input1.txt" "$HADOOP_DIR/input2.txt"
+            "$HADOOP_DIR/input.txt" "$HADOOP_DIR/input1.txt" "$HADOOP_DIR/input2.txt" \
+            "$HADOOP_DIR/weather.txt"
       start_services
       check_services
       experiment_1
       experiment_2
       experiment_3
+      experiment_4
       echo
-      echo "DONE: New sample files made and Experiments 1, 2 and 3 finished."
+      echo "DONE: New sample files made and Experiments 1, 2, 3 and 4 finished."
       [ "$FELL_BACK" = yes ] && echo "NOTE: YARN did not finish a job. Details: $OUT_DIR/yarn-problem.txt"
       ;;
     reset)
@@ -968,7 +1184,7 @@ main() {
       mkdir -p "$DATA_DIR"
       ok "Hadoop stopped and HDFS data deleted. Run: bash $SELF"
       ;;
-    *) echo "Usage: bash $0 [ex3|newdata|start|stop|status|reset]"; exit 2 ;;
+    *) echo "Usage: bash $0 [ex3|ex4|newdata|start|stop|status|reset]"; exit 2 ;;
   esac
 }
 
